@@ -8,6 +8,7 @@
 // @match        *://www.zhihu.com/question/*/answer/*
 // @match        *://www.zhihu.com/zvideo/*
 // @match        *://www.zhihu.com/column/*
+// @match        *://www.zhihu.com/people/*/posts
 // @match        *://blog.csdn.net/*/article/*
 // @match        *://blog.csdn.net/*/category_*.html
 // @match        *://mp.weixin.qq.com/s*
@@ -74,8 +75,8 @@
     };
 
     // Get article date from the page
-    const getArticleDate = (selector) => {
-        const dateElement = document.querySelector(selector);
+    const getArticleDate = (selector, root = document) => {
+        const dateElement = root.querySelector(selector);
         if (!dateElement) return '';
 
         const dateText = dateElement.textContent.trim();
@@ -156,8 +157,207 @@
         return service;
     };
 
+    // Small helper to pause between downloads
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    const normalizeUrl = (rawUrl, base = window.location.href) => {
+        if (!rawUrl) return '';
+        if (rawUrl.startsWith('data:')) {
+            return rawUrl;
+        }
+        if (rawUrl.startsWith('//')) {
+            return `${window.location.protocol}${rawUrl}`;
+        }
+        if (rawUrl.startsWith('http://') || rawUrl.startsWith('https://')) {
+            return rawUrl;
+        }
+        try {
+            const absolute = new URL(rawUrl, base);
+            return absolute.href;
+        } catch (error) {
+            console.warn('Failed to normalize url', rawUrl, error);
+            return rawUrl;
+        }
+    };
+
+    const parseIsoDate = (value) => {
+        if (!value) return '';
+        const date = new Date(value);
+        return isNaN(date.getTime()) ? '' : date.toISOString().split('T')[0];
+    };
+
+    const fetchedDocumentCache = new Map();
+    const imageDataCache = new Map();
+
+    const fetchDocument = (url) => {
+        const normalizedUrl = normalizeUrl(url);
+        if (!normalizedUrl) {
+            return Promise.reject(new Error('Invalid URL for fetching'));
+        }
+
+        if (fetchedDocumentCache.has(normalizedUrl)) {
+            return Promise.resolve(fetchedDocumentCache.get(normalizedUrl));
+        }
+
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: normalizedUrl,
+                onload: (response) => {
+                    if (response.status >= 200 && response.status < 400) {
+                        const parser = new DOMParser();
+                        const doc = parser.parseFromString(response.responseText, 'text/html');
+                        fetchedDocumentCache.set(normalizedUrl, doc);
+                        resolve(doc);
+                    } else {
+                        reject(new Error(`Failed to fetch ${normalizedUrl}: ${response.status}`));
+                    }
+                },
+                onerror: (error) => {
+                    reject(new Error(`Request error for ${normalizedUrl}: ${error.error || 'Unknown error'}`));
+                }
+            });
+        });
+    };
+
+    const extractContentFromDocument = (doc, url) => {
+        if (!doc) return null;
+
+        const title = doc.querySelector('h1.Post-Title')?.textContent.trim() ||
+                      doc.querySelector('h1.QuestionHeader-title')?.textContent.trim() ||
+                      doc.querySelector('title')?.textContent.trim() ||
+                      'Untitled';
+
+        let content = doc.querySelector('div.Post-RichTextContainer');
+        if (!content) {
+            content = doc.querySelector('div.RichContent-inner');
+        }
+
+        if (!content) {
+            return null;
+        }
+
+        const author = doc.querySelector('div.AuthorInfo meta[itemprop=\"name\"]')?.getAttribute('content') ||
+                       doc.querySelector('.AuthorInfo-name')?.textContent.trim() ||
+                       doc.querySelector('meta[itemprop=\"author\"]')?.getAttribute('content') ||
+                       'Unknown';
+
+        let date = '';
+        const publishedMeta = doc.querySelector('meta[itemprop=\"datePublished\"]')?.getAttribute('content');
+        if (publishedMeta) {
+            date = parseIsoDate(publishedMeta);
+        }
+        if (!date) {
+            const modifiedMeta = doc.querySelector('meta[itemprop=\"dateModified\"]')?.getAttribute('content');
+            if (modifiedMeta) {
+                date = parseIsoDate(modifiedMeta);
+            }
+        }
+        if (!date) {
+            date = getArticleDate('div.ContentItem-time', doc);
+        }
+
+        const canonicalUrl = doc.querySelector('meta[itemprop=\"url\"]')?.getAttribute('content') || url;
+
+        return {
+            title,
+            content,
+            author,
+            date,
+            url: normalizeUrl(canonicalUrl || url)
+        };
+    };
+
+    const fetchZhihuArticleDetails = async (url) => {
+        try {
+            const doc = await fetchDocument(url);
+            return extractContentFromDocument(doc, url);
+        } catch (error) {
+            console.warn('Failed to fetch remote article:', error);
+            return null;
+        }
+    };
+
+    const getContentTypeFromHeaders = (headers) => {
+        if (!headers) return '';
+        const match = headers.match(/content-type:\s*([^\n\r]+)/i);
+        if (match && match[1]) {
+            return match[1].split(';')[0].trim();
+        }
+        return '';
+    };
+
+    const arrayBufferToBase64 = (buffer) => {
+        if (!buffer) return '';
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        const chunkSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+            const chunk = bytes.subarray(i, i + chunkSize);
+            binary += String.fromCharCode.apply(null, chunk);
+        }
+        return btoa(binary);
+    };
+
+    const fetchImageAsDataUrl = (src, baseUrl = window.location.href) => {
+        const normalized = normalizeUrl(src, baseUrl);
+        if (!normalized) {
+            return Promise.resolve('');
+        }
+        if (normalized.startsWith('data:')) {
+            return Promise.resolve(normalized);
+        }
+        if (imageDataCache.has(normalized)) {
+            return Promise.resolve(imageDataCache.get(normalized));
+        }
+
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: normalized,
+                responseType: 'arraybuffer',
+                onload: (response) => {
+                    if (response.status >= 200 && response.status < 400) {
+                        const contentType = getContentTypeFromHeaders(response.responseHeaders) || 'application/octet-stream';
+                        const base64 = arrayBufferToBase64(response.response);
+                        const dataUrl = `data:${contentType};base64,${base64}`;
+                        imageDataCache.set(normalized, dataUrl);
+                        resolve(dataUrl);
+                    } else {
+                        reject(new Error(`Failed to load image ${normalized}: ${response.status}`));
+                    }
+                },
+                onerror: (error) => reject(new Error(`Image request error for ${normalized}: ${error.error || 'Unknown error'}`))
+            });
+        });
+    };
+
+    const convertImagesToDataUrls = async (root, baseUrl) => {
+        const images = Array.from(root.querySelectorAll('img'));
+        if (images.length === 0) return;
+
+        await Promise.all(images.map(async (img) => {
+            const src = img.getAttribute('src') ||
+                        img.getAttribute('data-original') ||
+                        img.getAttribute('data-src') ||
+                        img.getAttribute('data-actualsrc');
+            if (!src) {
+                return;
+            }
+            try {
+                const dataUrl = await fetchImageAsDataUrl(src, baseUrl);
+                if (dataUrl) {
+                    img.setAttribute('src', dataUrl);
+                    img.removeAttribute('srcset');
+                }
+            } catch (error) {
+                console.warn('Failed to embed image as base64', src, error);
+            }
+        }));
+    };
+
     // Process content for download
-    const processContent = (title, contentElement, author, date, url) => {
+    const processContent = async (title, contentElement, author, date, url) => {
         if (!contentElement) {
             throw new Error('Content element not found');
         }
@@ -168,8 +368,14 @@
         // Remove style tags
         content.querySelectorAll('style').forEach(style => style.remove());
 
+        // Remove scripts, noscript and load-more buttons
+        content.querySelectorAll('script, noscript').forEach(node => node.remove());
+        content.querySelectorAll('.ContentItem-more, button.ContentItem-more').forEach(node => node.remove());
+
         // Remove lazy loaded images
         content.querySelectorAll('img.lazy').forEach(img => img.remove());
+
+        await convertImagesToDataUrls(content, url);
 
         let markdown;
 
@@ -238,7 +444,7 @@
             }
 
             // Process content
-            const markdown = processContent(title, content, author, date, url);
+            const markdown = await processContent(title, content, author, date, url);
 
             // Download the markdown
             const filename = downloadMarkdownFile(title, author, markdown, date);
@@ -266,7 +472,7 @@
             }
 
             // Process content
-            const markdown = processContent(title, content, author, date, url);
+            const markdown = await processContent(title, content, author, date, url);
 
             // Download the markdown
             const filename = downloadMarkdownFile(title, author, markdown, date);
@@ -342,9 +548,92 @@
         }
     };
 
-    // Download column function
-    const downloadColumn = () => {
-        alert('Column download is not supported in the browser extension. Please use the server application for downloading columns.');
+    // Download visible articles on Zhihu list-style pages (column pages or user posts)
+    const downloadZhihuListArticles = async () => {
+        try {
+            const items = Array.from(document.querySelectorAll('.ContentItem'))
+                .filter(item => item.querySelector('.RichContent-inner'));
+
+            if (items.length === 0) {
+                throw new Error('未找到可下载的文章，请先展开或滚动页面加载内容');
+            }
+
+            showProgress(`准备下载 ${items.length} 篇文章...`);
+
+            let processed = 0;
+            for (const item of items) {
+                const title = item.querySelector('.ContentItem-title')?.textContent.trim() || `Article ${processed + 1}`;
+                const content = item.querySelector('.RichContent-inner');
+                if (!content) {
+                    console.warn('Skipping item without visible content');
+                    continue;
+                }
+
+                let author = item.querySelector('meta[itemprop=\"name\"]')?.getAttribute('content') ||
+                             item.querySelector('.AuthorInfo-name')?.textContent.trim() ||
+                             'Unknown';
+
+                let url = item.querySelector('meta[itemprop=\"url\"]')?.getAttribute('content') ||
+                          item.querySelector('.ContentItem-title a')?.href ||
+                          item.querySelector('a')?.href ||
+                          window.location.href;
+                url = normalizeUrl(url);
+
+                let date = '';
+                const publishedMeta = item.querySelector('meta[itemprop=\"datePublished\"]')?.getAttribute('content');
+                if (publishedMeta) {
+                    date = parseIsoDate(publishedMeta);
+                }
+                if (!date) {
+                    const modifiedMeta = item.querySelector('meta[itemprop=\"dateModified\"]')?.getAttribute('content');
+                    if (modifiedMeta) {
+                        date = parseIsoDate(modifiedMeta);
+                    }
+                }
+                if (!date) {
+                    const extraModule = item.getAttribute('data-za-extra-module');
+                    if (extraModule) {
+                        try {
+                            const moduleJson = JSON.parse(extraModule.replace(/&quot;/g, '\"'));
+                            const timestamp = moduleJson?.card?.content?.publish_timestamp;
+                            if (timestamp) {
+                                date = parseIsoDate(Number(timestamp));
+                            }
+                        } catch (err) {
+                            console.warn('Failed to parse data-za-extra-module', err);
+                        }
+                    }
+                }
+
+                let finalTitle = title;
+                let finalAuthor = author;
+                let finalDate = date;
+                let finalUrl = url || window.location.href;
+                let finalContent = content;
+
+                if (url) {
+                    const remoteArticle = await fetchZhihuArticleDetails(url);
+                    if (remoteArticle && remoteArticle.content) {
+                        finalTitle = remoteArticle.title || finalTitle;
+                        finalAuthor = remoteArticle.author || finalAuthor;
+                        finalDate = remoteArticle.date || finalDate;
+                        finalUrl = remoteArticle.url || url;
+                        finalContent = remoteArticle.content;
+                    }
+                }
+
+                const markdown = await processContent(finalTitle, finalContent, finalAuthor, finalDate, finalUrl);
+                const filename = downloadMarkdownFile(finalTitle, finalAuthor, markdown, finalDate);
+                processed += 1;
+                showProgress(`(${processed}/${items.length}) 已下载：${filename}`);
+                await sleep(400);
+            }
+
+            showProgress(`已完成 ${processed} 篇文章下载`, 4000);
+        } catch (error) {
+            console.error('Error downloading Zhihu list articles:', error);
+            showProgress(`Error: ${error.message}`, 4000);
+        }
     };
 
     // Download CSDN article function
@@ -375,7 +664,7 @@
             }
 
             // Process content
-            const markdown = processContent(title, content, author, date, url);
+            const markdown = await processContent(title, content, author, date, url);
 
             // Download the markdown
             const filename = downloadMarkdownFile(title, author, markdown, date);
@@ -434,7 +723,7 @@
             }
 
             // Process content
-            const markdown = processContent(title, content, author, date, url);
+            const markdown = await processContent(title, content, author, date, url);
 
             // Download the markdown
             const filename = downloadMarkdownFile(title, author, markdown, date);
@@ -469,7 +758,7 @@
             }
 
             // Process content
-            const markdown = processContent(title, content, author, date, url);
+            const markdown = await processContent(title, content, author, date, url);
 
             // Download the markdown
             const filename = downloadMarkdownFile(title, author, markdown, date);
@@ -591,6 +880,18 @@
         }
     };
 
+    const isZhihuPeoplePostsPage = (url) => {
+        return /zhihu\.com\/people\/.+\/posts/.test(url);
+    };
+
+    const isZhihuColumnListPage = (url) => {
+        return url.includes('www.zhihu.com/column/');
+    };
+
+    const isZhihuListDownloadPage = (url) => {
+        return isZhihuPeoplePostsPage(url) || isZhihuColumnListPage(url);
+    };
+
     // Handle download based on page type
     const handleDownload = () => {
         const url = window.location.href;
@@ -601,8 +902,8 @@
             downloadAnswer();
         } else if (url.includes('zhihu.com/zvideo/')) {
             downloadVideo();
-        } else if (url.includes('zhihu.com/column/')) {
-            downloadColumn();
+        } else if (isZhihuListDownloadPage(url)) {
+            downloadZhihuListArticles();
         } else if (url.includes('blog.csdn.net') && url.includes('/article/')) {
             downloadCsdnArticle();
         } else if (url.includes('blog.csdn.net') && url.includes('/category_')) {
@@ -625,7 +926,11 @@
         }
 
         const button = document.createElement('button');
+        const url = window.location.href;
         button.textContent = 'Download as Markdown';
+        if (isZhihuListDownloadPage(url)) {
+            button.textContent = '批量下载为Markdown';
+        }
         button.className = 'zhihu-dl-button';
         button.addEventListener('click', handleDownload);
         document.body.appendChild(button);
