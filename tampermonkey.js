@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         Zhihu2Markdown
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Download Zhihu content (articles, answers, videos, columns) as Markdown
 // @author       Glenn
 // @match        *://zhuanlan.zhihu.com/p/*
 // @match        *://www.zhihu.com/question/*/answer/*
 // @match        *://www.zhihu.com/zvideo/*
 // @match        *://www.zhihu.com/column/*
-// @match        *://www.zhihu.com/people/*/posts
+// @match        *://www.zhihu.com/column/*/*
+// @match        *://www.zhihu.com/people/*/posts*
 // @match        *://blog.csdn.net/*/article/*
 // @match        *://blog.csdn.net/*/category_*.html
 // @match        *://mp.weixin.qq.com/s*
@@ -16,12 +17,34 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_download
 // @grant        GM_addStyle
+// @connect      zhihu.com
+// @connect      www.zhihu.com
+// @connect      zhuanlan.zhihu.com
+// @connect      zhimg.com
+// @connect      *.zhimg.com
 // @require      https://cdn.jsdelivr.net/npm/turndown@7.1.1/dist/turndown.js
 // @run-at       document-end
 // ==/UserScript==
 
 (function() {
     'use strict';
+
+    const LOG_PREFIX = '[Zhihu2Markdown]';
+    const DEBUG = (() => {
+        try {
+            return localStorage.getItem('Zhihu2MarkdownDebug') === '1';
+        } catch (error) {
+            return false;
+        }
+    })();
+
+    const logInfo = (...args) => {
+        if (DEBUG) console.info(LOG_PREFIX, ...args);
+    };
+    const logWarn = (...args) => console.warn(LOG_PREFIX, ...args);
+    const logError = (...args) => console.error(LOG_PREFIX, ...args);
+
+    logInfo('userscript loaded', { href: location.href });
 
     // Add CSS for UI elements
     GM_addStyle(`
@@ -181,13 +204,144 @@
     };
 
     const parseIsoDate = (value) => {
-        if (!value) return '';
-        const date = new Date(value);
+        if (value === null || value === undefined || value === '') return '';
+
+        let dateInput = value;
+
+        if (typeof dateInput === 'string') {
+            const numeric = dateInput.trim();
+            if (/^\d+$/.test(numeric)) {
+                dateInput = Number(numeric);
+            }
+        }
+
+        if (typeof dateInput === 'number' && !Number.isNaN(dateInput)) {
+            if (dateInput < 1e12) {
+                dateInput *= 1000;
+            }
+            const date = new Date(dateInput);
+            return isNaN(date.getTime()) ? '' : date.toISOString().split('T')[0];
+        }
+
+        const date = new Date(dateInput);
         return isNaN(date.getTime()) ? '' : date.toISOString().split('T')[0];
+    };
+
+    const safeParseJSON = (text) => {
+        if (!text) return null;
+        try {
+            return JSON.parse(text);
+        } catch (error) {
+            logWarn('Failed to parse JSON:', error);
+            return null;
+        }
+    };
+
+    const detectZhihuBlockPage = (htmlText) => {
+        if (!htmlText || typeof htmlText !== 'string') return '';
+        if (/安全验证|captcha|验证码|verify|risk/i.test(htmlText)) return 'SECURITY_CHECK';
+        if (/SignFlow|请登录|登录知乎|登录后查看/i.test(htmlText)) return 'LOGIN_REQUIRED';
+        return '';
+    };
+
+    const buildContentElementFromHtml = (html) => {
+        if (!html || typeof html !== 'string') return null;
+        const container = document.createElement('div');
+        container.innerHTML = html;
+        return container;
+    };
+
+    const findEntityWithContent = (entities, preferredKeys = []) => {
+        if (!entities || typeof entities !== 'object') return null;
+
+        const tryBuckets = (key) => {
+            const bucket = entities[key];
+            if (!bucket || typeof bucket !== 'object') return null;
+            const candidate = Object.values(bucket).find(item => item && typeof item.content === 'string' && item.content.trim());
+            return candidate ? { key, entity: candidate } : null;
+        };
+
+        for (const key of preferredKeys) {
+            const found = tryBuckets(key);
+            if (found) return found;
+        }
+
+        for (const key of Object.keys(entities)) {
+            if (preferredKeys.includes(key)) continue;
+            const found = tryBuckets(key);
+            if (found) return found;
+        }
+
+        return null;
+    };
+
+    const extractFromInitialData = (doc, fallbackUrl) => {
+        if (!doc) return null;
+        const script = doc.querySelector('#js-initialData');
+        if (!script || !script.textContent) return null;
+
+        const parsed = safeParseJSON(script.textContent.trim());
+        if (!parsed) return null;
+
+        const state = parsed.initialState || parsed.data || parsed;
+        const entities = state?.entities;
+        if (!entities) return null;
+
+        const preferredKeys = ['articles', 'answers', 'posts', 'zvideos'];
+        const found = findEntityWithContent(entities, preferredKeys);
+        if (!found) return null;
+
+        const { key, entity } = found;
+        const content = buildContentElementFromHtml(entity.content);
+        if (!content) return null;
+
+        const title = entity.title || entity.question?.title || state?.title || '';
+        const author = entity.author?.name || entity.author?.urlToken || entity.user?.name || '';
+        const date = parseIsoDate(
+            entity.updated || entity.updatedTime ||
+            entity.publish_time || entity.publishTime ||
+            entity.created || entity.createdTime
+        );
+
+        let url = entity.url ? normalizeUrl(entity.url) : normalizeUrl(fallbackUrl);
+        if (!entity.url && entity.id) {
+            if (key === 'articles') {
+                url = normalizeUrl(`https://zhuanlan.zhihu.com/p/${entity.id}`);
+            } else if (key === 'answers' && entity.question?.id) {
+                url = normalizeUrl(`https://www.zhihu.com/question/${entity.question.id}/answer/${entity.id}`);
+            }
+        }
+
+        return { title, author, date, url, content };
     };
 
     const fetchedDocumentCache = new Map();
     const imageDataCache = new Map();
+
+    const DEFAULT_REFERER = 'https://www.zhihu.com/';
+
+    const getRefererForUrl = (url) => {
+        try {
+            const { origin } = new URL(url);
+            if (origin.includes('zhuanlan.zhihu.com')) {
+                return 'https://zhuanlan.zhihu.com/';
+            }
+        } catch (error) {
+            // ignore
+        }
+        return DEFAULT_REFERER;
+    };
+
+    const buildRequestHeaders = (url) => ({
+        'Referer': getRefererForUrl(url),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    });
+
+    const buildApiRequestHeaders = (url) => ({
+        'Referer': getRefererForUrl(url),
+        'Accept': 'application/json, text/plain, */*',
+        'X-Requested-With': 'XMLHttpRequest'
+    });
 
     const fetchDocument = (url) => {
         const normalizedUrl = normalizeUrl(url);
@@ -203,44 +357,122 @@
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: normalizedUrl,
+                headers: buildRequestHeaders(normalizedUrl),
+                withCredentials: true,
                 onload: (response) => {
+                    const finalUrl = response.finalUrl || normalizedUrl;
                     if (response.status >= 200 && response.status < 400) {
+                        const blocked = detectZhihuBlockPage(response.responseText);
+                        if (blocked) {
+                            logWarn('Zhihu returned a blocked page:', blocked, 'url=', normalizedUrl, 'finalUrl=', finalUrl);
+                        }
                         const parser = new DOMParser();
                         const doc = parser.parseFromString(response.responseText, 'text/html');
                         fetchedDocumentCache.set(normalizedUrl, doc);
                         resolve(doc);
                     } else {
+                        logWarn('Failed to fetch document:', normalizedUrl, 'status=', response.status, 'finalUrl=', finalUrl);
                         reject(new Error(`Failed to fetch ${normalizedUrl}: ${response.status}`));
                     }
                 },
                 onerror: (error) => {
+                    logWarn('GM_xmlhttpRequest onerror:', normalizedUrl, error);
                     reject(new Error(`Request error for ${normalizedUrl}: ${error.error || 'Unknown error'}`));
                 }
             });
         });
     };
 
+    const fetchJson = (url) => {
+        const normalizedUrl = normalizeUrl(url);
+        if (!normalizedUrl) {
+            return Promise.reject(new Error('Invalid URL for JSON fetching'));
+        }
+
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: normalizedUrl,
+                headers: buildApiRequestHeaders(normalizedUrl),
+                withCredentials: true,
+                onload: (response) => {
+                    const finalUrl = response.finalUrl || normalizedUrl;
+                    if (response.status >= 200 && response.status < 400) {
+                        const parsed = safeParseJSON(response.responseText);
+                        if (!parsed) {
+                            const blocked = detectZhihuBlockPage(response.responseText);
+                            if (blocked) {
+                                logWarn('API returned non-JSON (blocked):', blocked, 'url=', normalizedUrl, 'finalUrl=', finalUrl);
+                            } else {
+                                logWarn('API returned non-JSON:', normalizedUrl, 'finalUrl=', finalUrl);
+                            }
+                            reject(new Error(`Failed to parse JSON from ${normalizedUrl}`));
+                            return;
+                        }
+                        resolve(parsed);
+                    } else {
+                        logWarn('Failed to fetch JSON:', normalizedUrl, 'status=', response.status, 'finalUrl=', finalUrl);
+                        reject(new Error(`Failed to fetch JSON ${normalizedUrl}: ${response.status}`));
+                    }
+                },
+                onerror: (error) => {
+                    logWarn('GM_xmlhttpRequest JSON onerror:', normalizedUrl, error);
+                    reject(new Error(`JSON request error for ${normalizedUrl}: ${error.error || 'Unknown error'}`));
+                }
+            });
+        });
+    };
+
+    const extractZhihuArticleId = (url) => {
+        if (!url) return '';
+        const normalized = normalizeUrl(url);
+        const match = normalized.match(/\/p\/(\d+)/);
+        return match?.[1] || '';
+    };
+
+    const fetchZhihuArticleDetailsByApi = async (url) => {
+        const articleId = extractZhihuArticleId(url);
+        if (!articleId) return null;
+
+        const apiUrl = `https://www.zhihu.com/api/v4/articles/${articleId}?include=content,created,updated,title,url,author.name`;
+        try {
+            const data = await fetchJson(apiUrl);
+            if (!data || typeof data.content !== 'string' || !data.content.trim()) {
+                return null;
+            }
+            const content = buildContentElementFromHtml(data.content);
+            if (!content) return null;
+
+            return {
+                title: data.title || '',
+                author: data.author?.name || '',
+                date: parseIsoDate(data.updated || data.created),
+                url: normalizeUrl(data.url || `https://zhuanlan.zhihu.com/p/${articleId}`),
+                content
+            };
+        } catch (error) {
+            logWarn('API fallback failed:', error);
+            return null;
+        }
+    };
+
     const extractContentFromDocument = (doc, url) => {
         if (!doc) return null;
 
-        const title = doc.querySelector('h1.Post-Title')?.textContent.trim() ||
-                      doc.querySelector('h1.QuestionHeader-title')?.textContent.trim() ||
-                      doc.querySelector('title')?.textContent.trim() ||
-                      'Untitled';
+        let title = doc.querySelector('h1.Post-Title')?.textContent.trim() ||
+                    doc.querySelector('h1.QuestionHeader-title')?.textContent.trim() ||
+                    doc.querySelector('title')?.textContent.trim() ||
+                    'Untitled';
 
         let content = doc.querySelector('div.Post-RichTextContainer');
         if (!content) {
             content = doc.querySelector('div.RichContent-inner');
         }
 
-        if (!content) {
-            return null;
-        }
-
-        const author = doc.querySelector('div.AuthorInfo meta[itemprop=\"name\"]')?.getAttribute('content') ||
-                       doc.querySelector('.AuthorInfo-name')?.textContent.trim() ||
-                       doc.querySelector('meta[itemprop=\"author\"]')?.getAttribute('content') ||
-                       'Unknown';
+        let author = doc.querySelector('div.AuthorInfo meta[itemprop=\"name\"]')?.getAttribute('content') ||
+                     doc.querySelector('.AuthorInfo-name')?.textContent.trim() ||
+                     doc.querySelector('meta[itemprop=\"author\"]')?.getAttribute('content') ||
+                     'Unknown';
 
         let date = '';
         const publishedMeta = doc.querySelector('meta[itemprop=\"datePublished\"]')?.getAttribute('content');
@@ -257,7 +489,29 @@
             date = getArticleDate('div.ContentItem-time', doc);
         }
 
-        const canonicalUrl = doc.querySelector('meta[itemprop=\"url\"]')?.getAttribute('content') || url;
+        let canonicalUrl = doc.querySelector('meta[itemprop=\"url\"]')?.getAttribute('content') || url;
+
+        const shouldUseFallback = () => {
+            if (!content) return true;
+            const text = content.textContent?.trim() || '';
+            if (text.length < 200) return true;
+            const hasReadMore = Boolean(content.querySelector('button.ContentItem-more')) ||
+                /阅读全文/.test(text);
+            return hasReadMore;
+        };
+
+        if (shouldUseFallback()) {
+            const fallback = extractFromInitialData(doc, canonicalUrl || url);
+            if (fallback) {
+                if (fallback.title) title = fallback.title;
+                if (fallback.author) author = fallback.author;
+                if (fallback.date) date = fallback.date;
+                if (fallback.url) canonicalUrl = fallback.url;
+                if (fallback.content) content = fallback.content;
+            }
+        }
+
+        if (!content) return null;
 
         return {
             title,
@@ -271,9 +525,18 @@
     const fetchZhihuArticleDetails = async (url) => {
         try {
             const doc = await fetchDocument(url);
-            return extractContentFromDocument(doc, url);
+            const extracted = extractContentFromDocument(doc, url);
+            if (extracted?.content) {
+                return extracted;
+            }
+
+            logWarn('Remote document fetched but no content extracted, trying API fallback:', url);
+            const apiFallback = await fetchZhihuArticleDetailsByApi(url);
+            return apiFallback || extracted;
         } catch (error) {
-            console.warn('Failed to fetch remote article:', error);
+            logWarn('Failed to fetch remote article:', error);
+            const apiFallback = await fetchZhihuArticleDetailsByApi(url);
+            if (apiFallback) return apiFallback;
             return null;
         }
     };
@@ -316,6 +579,8 @@
                 method: 'GET',
                 url: normalized,
                 responseType: 'arraybuffer',
+                headers: buildRequestHeaders(normalized),
+                withCredentials: true,
                 onload: (response) => {
                     if (response.status >= 200 && response.status < 400) {
                         const contentType = getContentTypeFromHeaders(response.responseHeaders) || 'application/octet-stream';
@@ -372,8 +637,7 @@
         content.querySelectorAll('script, noscript').forEach(node => node.remove());
         content.querySelectorAll('.ContentItem-more, button.ContentItem-more').forEach(node => node.remove());
 
-        // Remove lazy loaded images
-        content.querySelectorAll('img.lazy').forEach(img => img.remove());
+        // Keep lazy-loaded images; we will resolve src via data-* attributes when embedding.
 
         await convertImagesToDataUrls(content, url);
 
@@ -551,82 +815,116 @@
     // Download visible articles on Zhihu list-style pages (column pages or user posts)
     const downloadZhihuListArticles = async () => {
         try {
-            const items = Array.from(document.querySelectorAll('.ContentItem'))
-                .filter(item => item.querySelector('.RichContent-inner'));
+            const collectEntriesFromDom = () => {
+                const container = document.querySelector('#Profile-posts') || document;
+                const nodes = Array.from(container.querySelectorAll('.ContentItem.ArticleItem, .ContentItem'));
+                const entries = new Map();
 
-            if (items.length === 0) {
-                throw new Error('未找到可下载的文章，请先展开或滚动页面加载内容');
-            }
+                for (const item of nodes) {
+                    const linkEl = item.querySelector('.ContentItem-title a') || item.querySelector('a[href*="/p/"]');
+                    const rawUrl = linkEl?.getAttribute('href') || '';
+                    const url = normalizeUrl(rawUrl);
+                    if (!url || !/\/p\/\d+/.test(url)) continue;
 
-            showProgress(`准备下载 ${items.length} 篇文章...`);
+                    const title = linkEl?.textContent?.trim() || item.querySelector('.ContentItem-title')?.textContent?.trim() || url;
+                    const author = item.querySelector('meta[itemprop="name"]')?.getAttribute('content') ||
+                        item.querySelector('.AuthorInfo-name')?.textContent.trim() ||
+                        'Unknown';
 
-            let processed = 0;
-            for (const item of items) {
-                const title = item.querySelector('.ContentItem-title')?.textContent.trim() || `Article ${processed + 1}`;
-                const content = item.querySelector('.RichContent-inner');
-                if (!content) {
-                    console.warn('Skipping item without visible content');
-                    continue;
-                }
-
-                let author = item.querySelector('meta[itemprop=\"name\"]')?.getAttribute('content') ||
-                             item.querySelector('.AuthorInfo-name')?.textContent.trim() ||
-                             'Unknown';
-
-                let url = item.querySelector('meta[itemprop=\"url\"]')?.getAttribute('content') ||
-                          item.querySelector('.ContentItem-title a')?.href ||
-                          item.querySelector('a')?.href ||
-                          window.location.href;
-                url = normalizeUrl(url);
-
-                let date = '';
-                const publishedMeta = item.querySelector('meta[itemprop=\"datePublished\"]')?.getAttribute('content');
-                if (publishedMeta) {
-                    date = parseIsoDate(publishedMeta);
-                }
-                if (!date) {
-                    const modifiedMeta = item.querySelector('meta[itemprop=\"dateModified\"]')?.getAttribute('content');
-                    if (modifiedMeta) {
-                        date = parseIsoDate(modifiedMeta);
+                    let date = '';
+                    const publishedMeta = item.querySelector('meta[itemprop="datePublished"]')?.getAttribute('content');
+                    if (publishedMeta) date = parseIsoDate(publishedMeta);
+                    if (!date) {
+                        const modifiedMeta = item.querySelector('meta[itemprop="dateModified"]')?.getAttribute('content');
+                        if (modifiedMeta) date = parseIsoDate(modifiedMeta);
                     }
-                }
-                if (!date) {
-                    const extraModule = item.getAttribute('data-za-extra-module');
-                    if (extraModule) {
-                        try {
-                            const moduleJson = JSON.parse(extraModule.replace(/&quot;/g, '\"'));
-                            const timestamp = moduleJson?.card?.content?.publish_timestamp;
-                            if (timestamp) {
-                                date = parseIsoDate(Number(timestamp));
+                    if (!date) {
+                        const extraModule = item.getAttribute('data-za-extra-module');
+                        if (extraModule) {
+                            try {
+                                const moduleJson = JSON.parse(extraModule.replace(/&quot;/g, '"'));
+                                const timestamp = moduleJson?.card?.content?.publish_timestamp;
+                                if (timestamp) date = parseIsoDate(Number(timestamp));
+                            } catch (err) {
+                                logWarn('Failed to parse data-za-extra-module', err);
                             }
-                        } catch (err) {
-                            console.warn('Failed to parse data-za-extra-module', err);
                         }
                     }
+
+                    entries.set(url, { url, title, author, date });
                 }
 
-                let finalTitle = title;
-                let finalAuthor = author;
-                let finalDate = date;
-                let finalUrl = url || window.location.href;
-                let finalContent = content;
+                return entries;
+            };
 
-                if (url) {
-                    const remoteArticle = await fetchZhihuArticleDetails(url);
-                    if (remoteArticle && remoteArticle.content) {
-                        finalTitle = remoteArticle.title || finalTitle;
-                        finalAuthor = remoteArticle.author || finalAuthor;
-                        finalDate = remoteArticle.date || finalDate;
-                        finalUrl = remoteArticle.url || url;
-                        finalContent = remoteArticle.content;
+            const autoCollectEntries = async () => {
+                const all = new Map();
+                let idleRounds = 0;
+                let lastSize = 0;
+                const maxIdleRounds = 4;
+                const maxRounds = 80;
+
+                for (let round = 0; round < maxRounds; round += 1) {
+                    const current = collectEntriesFromDom();
+                    for (const [url, entry] of current.entries()) {
+                        if (!all.has(url)) {
+                            all.set(url, entry);
+                        }
                     }
+
+                    showProgress(`已收集链接：${all.size}（滚动加载中…）`);
+
+                    if (all.size === lastSize) {
+                        idleRounds += 1;
+                    } else {
+                        idleRounds = 0;
+                        lastSize = all.size;
+                    }
+
+                    if (idleRounds >= maxIdleRounds) break;
+
+                    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+                    await sleep(1200);
                 }
 
-                const markdown = await processContent(finalTitle, finalContent, finalAuthor, finalDate, finalUrl);
-                const filename = downloadMarkdownFile(finalTitle, finalAuthor, markdown, finalDate);
-                processed += 1;
-                showProgress(`(${processed}/${items.length}) 已下载：${filename}`);
-                await sleep(400);
+                return Array.from(all.values());
+            };
+
+            const proceed = window.confirm('将自动滚动页面收集文章链接后批量下载，是否继续？');
+            if (!proceed) return;
+
+            const entries = await autoCollectEntries();
+            if (entries.length === 0) {
+                throw new Error('未找到可下载的文章链接（请确认在“文章”页签，且页面已加载内容）');
+            }
+
+            showProgress(`准备下载 ${entries.length} 篇文章...`);
+
+            let processed = 0;
+            for (const entry of entries) {
+                try {
+                    showProgress(`(${processed + 1}/${entries.length}) 正在抓取文章详情...`);
+
+                    const remoteArticle = await fetchZhihuArticleDetails(entry.url);
+                    if (!remoteArticle || !remoteArticle.content) {
+                        throw new Error(`无法获取正文：${entry.url}`);
+                    }
+
+                    const finalTitle = remoteArticle.title || entry.title || `Article ${processed + 1}`;
+                    const finalAuthor = remoteArticle.author || entry.author || 'Unknown';
+                    const finalDate = remoteArticle.date || entry.date || '';
+                    const finalUrl = remoteArticle.url || entry.url;
+
+                    const markdown = await processContent(finalTitle, remoteArticle.content, finalAuthor, finalDate, finalUrl);
+                    const filename = downloadMarkdownFile(finalTitle, finalAuthor, markdown, finalDate);
+                    processed += 1;
+                    showProgress(`(${processed}/${entries.length}) 已下载：${filename}`);
+                    await sleep(400);
+                } catch (error) {
+                    logWarn('Failed to download one item, skipping:', error);
+                    showProgress(`(${processed + 1}/${entries.length}) 跳过：${error.message}`, 2000);
+                    await sleep(200);
+                }
             }
 
             showProgress(`已完成 ${processed} 篇文章下载`, 4000);
@@ -895,6 +1193,7 @@
     // Handle download based on page type
     const handleDownload = () => {
         const url = window.location.href;
+        logInfo('download clicked', { href: url });
 
         if (url.includes('zhuanlan.zhihu.com/p/')) {
             downloadArticle();
@@ -934,6 +1233,7 @@
         button.className = 'zhihu-dl-button';
         button.addEventListener('click', handleDownload);
         document.body.appendChild(button);
+        logInfo('button injected', { href: url, text: button.textContent });
     };
 
     // Initialize
@@ -947,6 +1247,7 @@
             const url = location.href;
             if (url !== lastUrl) {
                 lastUrl = url;
+                logInfo('SPA navigation detected', { href: url });
                 setTimeout(addDownloadButton, 1500);
             }
         }).observe(document, {subtree: true, childList: true});
